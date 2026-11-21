@@ -1,485 +1,494 @@
-// OSMARA — The Tidal Sanctuary
-// A travel poster for a place that does not exist.
-// Pure Node, zero dependencies, no network. Renders a 1024x1024 PNG to /output/entry.png
-// with a hand-written rasterizer and a hand-written PNG encoder.
-// Deterministic: every value is fixed or comes from a seeded PRNG.
+// OSMARA — "The Tidal Sanctuary". Revised travel poster for a place that
+// does not exist. Pure Node 22, zero dependencies. Draws the poster with
+// code and writes a 1024x1024 PNG to /output/entry.png using its own encoder.
+// Revision: the dark arch is shrunk to a slim sunlit band, the terraces and
+// lagoon fill the frame, glowing salt-glass pavilions and tiered tidal pools
+// give Osmara an invented signature, and the name is larger and bolder.
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
 
-import { writeFileSync, mkdirSync } from "node:fs";
-import { deflateSync } from "node:zlib";
+// ---------------- PNG encoder (own implementation) ----------------
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+function encodePng(width, height, rgba) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const raw = Buffer.alloc(height * (1 + width * 4));
+  for (let y = 0; y < height; y++) {
+    raw[y * (1 + width * 4)] = 0;
+    rgba.copy(raw, y * (1 + width * 4) + 1, y * width * 4, (y + 1) * width * 4);
+  }
+  const idat = zlib.deflateSync(raw, { level: 9 });
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
 
-// ---------------------------------------------------------------- palette
-const INDIGO = [16, 24, 40];       // Abyssal Indigo  #101828
-const INDIGO2 = [22, 30, 51];      // deep cliff shadow
-const VERDIGRIS = [30, 107, 123];  // Tidal Verdigris #1E6B7B
-const SEAFOAM = [110, 231, 216];   // Luminous Seafoam #6EE7D8
-const ALABASTER = [246, 238, 219]; // Warm Alabaster  #F6EEDB
-const APRICOT = [242, 153, 102];   // Apricot Dusk    #F29966
-const SAFFRON = [232, 184, 75];    // Burnished Saffron #E8B84B
-const GOLD = [246, 196, 83];
-const DARKWOOD = [36, 26, 18];
-
-// ---------------------------------------------------------------- canvas (rendered at 2x, downsampled for crisp edges)
-const SS = 2;
-const W = 1024, H = 1024;
-const DW = W * SS, DH = H * SS;
-const buf = new Uint8Array(DW * DH * 3);
-
-// Seeded PRNG (deterministic)
+// ---------------- Deterministic PRNG (seeded, no Math.random) ----------------
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 const rand = mulberry32(20261121);
 
-// ---------------------------------------------------------------- low-level pixel ops (device coords)
-function mixPixel(x, y, r, g, b, a) {
-  if (x < 0 || y < 0 || x >= DW || y >= DH) return;
-  const i = (y * DW + x) * 3;
-  if (a >= 1) { buf[i] = r; buf[i + 1] = g; buf[i + 2] = b; return; }
-  buf[i] = Math.round(buf[i] * (1 - a) + r * a);
-  buf[i + 1] = Math.round(buf[i + 1] * (1 - a) + g * a);
-  buf[i + 2] = Math.round(buf[i + 2] * (1 - a) + b * a);
-}
-function addPixel(x, y, r, g, b, a) {
-  if (x < 0 || y < 0 || x >= DW || y >= DH || a <= 0) return;
-  const i = (y * DW + x) * 3;
-  buf[i] = Math.min(255, buf[i] + r * a);
-  buf[i + 1] = Math.min(255, buf[i + 1] + g * a);
-  buf[i + 2] = Math.min(255, buf[i + 2] + b * a);
-}
-// logical (1024-space) -> device
-const D = (v) => Math.round(v * SS);
+// ---------------- Canvas (2x supersampled, coords in 1024 space) ----------------
+const W = 1024, H = 1024, SS = 2, CW = W * SS, CH = H * SS;
+const pixels = new Uint8Array(CW * CH * 4);
 
-// Fill a horizontal span on one device row
-function span(y, x0, x1, r, g, b, a) {
-  if (y < 0 || y >= DH) return;
-  let xa = Math.max(0, Math.ceil(x0)), xb = Math.min(DW - 1, Math.floor(x1));
-  if (xb < xa) return;
-  const row = y * DW * 3;
-  for (let x = xa; x <= xb; x++) {
-    const i = row + x * 3;
-    if (a >= 1) { buf[i] = r; buf[i + 1] = g; buf[i + 2] = b; }
+function rgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function mix(c1, c2, t) {
+  return [c1[0] + (c2[0] - c1[0]) * t, c1[1] + (c2[1] - c1[1]) * t, c1[2] + (c2[2] - c1[2]) * t];
+}
+function px(x, y, r, g, b, a) {
+  if (x < 0 || x >= CW || y < 0 || y >= CH || a <= 0) return;
+  const i = (y * CW + x) * 4;
+  if (a >= 1) { pixels[i] = r; pixels[i + 1] = g; pixels[i + 2] = b; pixels[i + 3] = 255; return; }
+  const ia = 1 - a;
+  pixels[i] = Math.round(r * a + pixels[i] * ia);
+  pixels[i + 1] = Math.round(g * a + pixels[i + 1] * ia);
+  pixels[i + 2] = Math.round(b * a + pixels[i + 2] * ia);
+  pixels[i + 3] = 255;
+}
+function fillRect(x, y, w, h, hex, a = 1) {
+  const c = rgb(hex);
+  const x0 = Math.max(0, Math.floor(x * SS)), x1 = Math.min(CW - 1, Math.ceil((x + w) * SS));
+  const y0 = Math.max(0, Math.floor(y * SS)), y1 = Math.min(CH - 1, Math.ceil((y + h) * SS));
+  for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) px(xx, yy, c[0], c[1], c[2], a);
+}
+function vgrad(x, y, w, h, stops) {
+  const cols = stops.map(([t, hex]) => [t, rgb(hex)]);
+  const x0 = Math.max(0, Math.floor(x * SS)), x1 = Math.min(CW - 1, Math.ceil((x + w) * SS));
+  const y0 = Math.max(0, Math.floor(y * SS)), y1 = Math.min(CH - 1, Math.ceil((y + h) * SS));
+  for (let yy = y0; yy <= y1; yy++) {
+    const t = (yy / SS - y) / h;
+    let c;
+    if (t <= cols[0][0]) c = cols[0][1];
+    else if (t >= cols[cols.length - 1][0]) c = cols[cols.length - 1][1];
     else {
-      buf[i] = Math.round(buf[i] * (1 - a) + r * a);
-      buf[i + 1] = Math.round(buf[i + 1] * (1 - a) + g * a);
-      buf[i + 2] = Math.round(buf[i + 2] * (1 - a) + b * a);
-    }
-  }
-}
-
-// Scanline polygon fill. contours: array of point arrays [[x,y],...] in device coords.
-// Even-odd rule, so a contour inside another cuts a hole (used for the O ring, crescent).
-function fillPoly(contours, rgb, a = 1) {
-  const [r, g, b] = rgb;
-  let minY = Infinity, maxY = -Infinity;
-  for (const c of contours) for (const p of c) { if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1]; }
-  const y0 = Math.max(0, Math.ceil(minY - 0.5)), y1 = Math.min(DH - 1, Math.floor(maxY - 0.5));
-  const xs = [];
-  for (let y = y0; y <= y1; y++) {
-    const yc = y + 0.5;
-    xs.length = 0;
-    for (const c of contours) {
-      for (let k = 0; k < c.length; k++) {
-        const p0 = c[k], p1 = c[(k + 1) % c.length];
-        if ((p0[1] <= yc && p1[1] > yc) || (p1[1] <= yc && p0[1] > yc)) {
-          xs.push(p0[0] + (yc - p0[1]) * (p1[0] - p0[0]) / (p1[1] - p0[1]));
+      for (let i = 0; i < cols.length - 1; i++) {
+        if (t >= cols[i][0] && t <= cols[i + 1][0]) {
+          const f = (t - cols[i][0]) / (cols[i + 1][0] - cols[i][0]);
+          c = mix(cols[i][1], cols[i + 1][1], f);
+          break;
         }
       }
     }
-    xs.sort((m, n) => m - n);
-    for (let k = 0; k + 1 < xs.length; k += 2) span(y, xs[k], xs[k + 1], r, g, b, a);
+    for (let xx = x0; xx <= x1; xx++) px(xx, yy, c[0], c[1], c[2], 1);
   }
 }
-
-// Filled disc (device coords)
-function disc(cx, cy, rad, rgb, a = 1) {
-  const [r, g, b] = rgb;
-  const r0 = Math.max(1, Math.ceil(rad));
-  for (let dy = -r0; dy <= r0; dy++) {
-    const dx = Math.sqrt(Math.max(0, rad * rad - dy * dy));
-    span(Math.round(cy) + dy, cx - dx, cx + dx, r, g, b, a);
+function fillCircle(cx, cy, r, hex, a = 1) {
+  const c = rgb(hex);
+  const x0 = Math.max(0, Math.floor((cx - r) * SS)), x1 = Math.min(CW - 1, Math.ceil((cx + r) * SS));
+  const y0 = Math.max(0, Math.floor((cy - r) * SS)), y1 = Math.min(CH - 1, Math.ceil((cy + r) * SS));
+  for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) {
+    const dx = xx / SS + 0.25 - cx, dy = yy / SS + 0.25 - cy;
+    if (dx * dx + dy * dy <= r * r) px(xx, yy, c[0], c[1], c[2], a);
   }
 }
-
-// Soft radial glow, additive
-function glow(cx, cy, rad, rgb, strength) {
-  const [r, g, b] = rgb;
-  const x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(DW - 1, Math.ceil(cx + rad));
-  const y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(DH - 1, Math.ceil(cy + rad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / rad;
-      if (d >= 1) continue;
-      const t = (1 - d) * (1 - d) * strength;
-      addPixel(x, y, r, g, b, t);
+function fillPoly(points, hex, a = 1) {
+  const c = rgb(hex);
+  const pts = points.map(([x, y]) => [x * SS, y * SS]);
+  let minY = Infinity, maxY = -Infinity;
+  for (const [, y] of pts) { if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  minY = Math.max(0, Math.floor(minY));
+  maxY = Math.min(CH - 1, Math.ceil(maxY));
+  for (let yy = minY; yy <= maxY; yy++) {
+    const yc = yy + 0.5;
+    const xs = [];
+    for (let i = 0; i < pts.length; i++) {
+      const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length];
+      if ((y1 <= yc && y2 > yc) || (y2 <= yc && y1 > yc)) xs.push(x1 + (yc - y1) * (x2 - x1) / (y2 - y1));
+    }
+    xs.sort((p, q) => p - q);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const x0 = Math.max(0, Math.ceil(xs[k])), x1 = Math.min(CW - 1, Math.floor(xs[k + 1]));
+      for (let xx = x0; xx <= x1; xx++) px(xx, yy, c[0], c[1], c[2], a);
     }
   }
 }
-
-// Thick polyline with round joins and caps. pts in logical coords.
-function strokePath(pts, width, rgb, closed = false, a = 1) {
-  const w = width * SS / 2;
-  const n = pts.length;
-  const segs = closed ? n : n - 1;
-  for (let k = 0; k < segs; k++) {
-    const p0 = pts[k], p1 = pts[(k + 1) % n];
-    const dx = (p1[0] - p0[0]) * SS, dy = (p1[1] - p0[1]) * SS;
-    const len = Math.hypot(dx, dy);
-    if (len < 0.001) continue;
-    const nx = -dy / len * w, ny = dx / len * w;
-    const x0 = p0[0] * SS, y0 = p0[1] * SS, x1 = p1[0] * SS, y1 = p1[1] * SS;
-    fillPoly([[[x0 + nx, y0 + ny], [x1 + nx, y1 + ny], [x1 - nx, y1 - ny], [x0 - nx, y0 - ny]]], rgb, a);
+function strokePoly(points, width, hex, a = 1) {
+  for (let i = 0; i < points.length - 1; i++) {
+    const [x1, y1] = points[i], [x2, y2] = points[i + 1];
+    const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len * width / 2, ny = dx / len * width / 2;
+    fillPoly([[x1 + nx, y1 + ny], [x2 + nx, y2 + ny], [x2 - nx, y2 - ny], [x1 - nx, y1 - ny]], hex, a);
   }
-  for (let k = 0; k < n; k++) {
-    if (!closed && (k === 0 || k === n - 1)) disc(pts[k][0] * SS, pts[k][1] * SS, w, rgb, a);
-    else disc(pts[k][0] * SS, pts[k][1] * SS, w, rgb, a);
+  for (const [x, y] of points) fillCircle(x, y, width / 2, hex, a);
+}
+function glow(cx, cy, r, hex, peak = 0.5) {
+  const steps = 12;
+  for (let i = steps; i >= 1; i--) {
+    const f = i / steps;
+    fillCircle(cx, cy, r * f, hex, peak * (1 - f) * (1 - f) * 0.4);
   }
 }
 
-// Vertical gradient over a logical rect. stops: [[pos0..1, [r,g,b]], ...]
-function vgrad(x0, x1, y0, y1, stops) {
-  const xa = D(x0), xb = D(x1);
-  for (let y = D(y0); y < D(y1); y++) {
-    const t = (y / SS - y0) / (y1 - y0);
-    let s0 = stops[0], s1 = stops[stops.length - 1];
-    for (let k = 0; k + 1 < stops.length; k++) {
-      if (t >= stops[k][0] && t <= stops[k + 1][0]) { s0 = stops[k]; s1 = stops[k + 1]; break; }
+// ---------------- Geometric letterforms (12x16 grid, stroke polylines) ----------------
+const GLYPHS = {
+  A: [[[0, 16], [6, 0], [12, 16]], [[3.4, 11], [8.6, 11]]],
+  C: [[[11, 2], [8, 0], [4, 0], [1, 3], [1, 13], [4, 16], [8, 16], [11, 14]]],
+  D: [[[0, 0], [7, 0], [11, 4], [11, 12], [7, 16], [0, 16], [0, 0]]],
+  E: [[[11, 0], [0, 0], [0, 16], [11, 16]], [[0, 8], [8, 8]]],
+  H: [[[0, 0], [0, 16]], [[12, 0], [12, 16]], [[0, 8], [12, 8]]],
+  I: [[[6, 0], [6, 16]], [[2, 0], [10, 0]], [[2, 16], [10, 16]]],
+  L: [[[0, 0], [0, 16], [11, 16]]],
+  M: [[[0, 16], [0, 0], [6, 10], [12, 0], [12, 16]]],
+  N: [[[0, 16], [0, 0], [12, 16], [12, 0]]],
+  O: [[[3, 0], [9, 0], [12, 3], [12, 13], [9, 16], [3, 16], [0, 13], [0, 3], [3, 0]]],
+  R: [[[0, 16], [0, 0], [8, 0], [11, 3], [11, 7], [8, 10], [0, 10]], [[6.5, 10], [12, 16]]],
+  S: [[[10, 2], [7, 0], [4, 0], [1, 3], [1, 6], [3, 8], [9, 8], [11, 10], [11, 13], [8, 16], [4, 16], [1, 13]]],
+  T: [[[0, 0], [12, 0]], [[6, 0], [6, 16]]],
+  U: [[[0, 0], [0, 12], [3, 16], [9, 16], [12, 12], [12, 0]]],
+  Y: [[[0, 0], [6, 8], [12, 0]], [[6, 8], [6, 16]]],
+};
+function textWidth(text, size, tracking) {
+  let w = 0;
+  for (const ch of text) {
+    if (ch === ' ') w += size * 0.5 + tracking;
+    else w += size * 0.75 + tracking;
+  }
+  return w - tracking;
+}
+function drawText(text, x, y, size, hex, tracking = 0, strokeUnits = 3, a = 1) {
+  const s = size / 16;
+  const w = strokeUnits * s;
+  let cx = x;
+  for (const ch of text) {
+    if (ch === ' ') { cx += size * 0.5 + tracking; continue; }
+    const glyph = GLYPHS[ch];
+    if (!glyph) { cx += size * 0.75 + tracking; continue; }
+    for (const stroke of glyph) {
+      const pts = stroke.map(([gx, gy]) => [cx + gx * s, y + gy * s]);
+      strokePoly(pts, w, hex, a);
     }
-    const f = s1[0] === s0[0] ? 0 : (t - s0[0]) / (s1[0] - s0[0]);
-    const r = Math.round(s0[1][0] + (s1[1][0] - s0[1][0]) * f);
-    const g = Math.round(s0[1][1] + (s1[1][1] - s0[1][1]) * f);
-    const b = Math.round(s0[1][2] + (s1[1][2] - s0[1][2]) * f);
-    span(y, xa, xb, r, g, b, 1);
+    cx += size * 0.75 + tracking;
   }
 }
 
-function rect(x0, y0, x1, y1, rgb, a = 1) {
-  for (let y = D(y0); y < D(y1); y++) span(y, D(x0), D(x1), rgb[0], rgb[1], rgb[2], a);
+// ---------------- Palette ----------------
+const INDIGO = '#101828';
+const VERDIGRIS = '#1E6B7B';
+const SEAFOAM = '#6EE7D8';
+const ALABASTER = '#F6EEDB';
+const APRICOT = '#F29966';
+const SAFFRON = '#E8B84B';
+const VIOLET = '#2E2450';
+const GOLD = '#F7C87E';
+const SAND = '#D9B48A';
+const TERRA = '#A06A48';
+const CREAM = '#F6EBD8';
+const DEEPTEAL = '#14324A';
+
+// ---------------- Sky ----------------
+function drawSky() {
+  vgrad(0, 0, 1024, 600, [
+    [0, VIOLET], [0.22, '#5C3A63'], [0.45, '#C96A4E'],
+    [0.7, APRICOT], [0.88, GOLD], [1, '#F2C078'],
+  ]);
+  // Stars only in the top band, above the title.
+  for (let i = 0; i < 46; i++) {
+    const x = 8 + rand() * 1008;
+    const y = 8 + rand() * 96;
+    const r = 0.8 + rand() * 1.4;
+    fillCircle(x, y, r, ALABASTER, 0.35 + rand() * 0.5);
+  }
+  // A few birds crossing the open sky.
+  for (const [bx, by, bs] of [[300, 340, 1], [360, 372, 0.8], [700, 330, 1], [760, 366, 0.7], [520, 410, 0.9]]) {
+    strokePoly([[bx - 9 * bs, by], [bx, by - 6 * bs], [bx + 9 * bs, by]], 3, '#241A44', 0.7);
+  }
+  // Low mist band softening the horizon.
+  fillRect(0, 556, 1024, 44, '#F2C078', 0.16);
+  fillRect(0, 582, 1024, 22, ALABASTER, 0.10);
 }
 
-// Ellipse outline points (logical coords)
-function ellipsePts(cx, cy, rx, ry, a0, a1, steps) {
+// ---------------- Sun ----------------
+function drawSun() {
+  glow(640, 545, 175, GOLD, 0.55);
+  fillCircle(640, 545, 52, '#F7C87E');
+  fillCircle(640, 545, 40, '#FBE9B8');
+}
+
+// ---------------- Lagoon water ----------------
+function drawWater() {
+  vgrad(0, 600, 1024, 350, [
+    [0, '#F2B06A'], [0.15, '#C98A5E'], [0.3, '#4E7A72'],
+    [0.5, VERDIGRIS], [0.75, DEEPTEAL], [1, INDIGO],
+  ]);
+  // A low distant headland silhouette on the horizon, left of the sun.
+  fillPoly([[300, 600], [360, 576], [430, 584], [480, 600]], '#3A2A44', 0.85);
+  // Sun reflection: a shimmering gold column under the sun.
+  for (let i = 0; i < 26; i++) {
+    const y = 610 + i * 11;
+    const w = 72 + 42 * Math.sin(i * 0.7) + rand() * 22;
+    const a = 0.55 * (1 - i / 26) + 0.06;
+    fillRect(640 - w / 2 + (rand() - 0.5) * 16, y, w, 3.5, GOLD, a);
+  }
+  // Ripples across the lagoon.
+  for (let i = 0; i < 70; i++) {
+    const y = 615 + rand() * 325;
+    const x = rand() * 940;
+    const len = 30 + rand() * 150;
+    const col = rand() < 0.6 ? SEAFOAM : GOLD;
+    fillRect(x, y, len, 2, col, 0.10 + rand() * 0.20);
+  }
+  // Dark reflections under the cliffs soften the waterline.
+  fillRect(0, 600, 185, 96, INDIGO, 0.30);
+  fillRect(839, 600, 185, 96, INDIGO, 0.30);
+  // Bioluminescent shallows near the pavilions.
+  glow(180, 892, 120, SEAFOAM, 0.30);
+  glow(862, 872, 100, SEAFOAM, 0.28);
+  // Seafoam sparkles in the twilight shallows.
+  for (let i = 0; i < 42; i++) {
+    const x = 220 + rand() * 600;
+    const y = 800 + rand() * 140;
+    fillCircle(x, y, 1 + rand() * 1.2, SEAFOAM, 0.35 + rand() * 0.45);
+  }
+}
+
+// ---------------- Slim sunlit arch (top band, no longer swallowing the frame) ----------------
+function archCurveY(x) {
+  return 34 + 62 * Math.sin((Math.PI * x) / 1024);
+}
+function drawArch() {
+  const pts = [[0, 0], [1024, 0], [1024, 34]];
+  for (let x = 1024; x >= 0; x -= 32) pts.push([x, archCurveY(x)]);
+  pts.push([0, 34]);
+  fillPoly(pts, '#E8D9B8');
+  // Stone shading along the inner edge and a saffron rim line.
+  const curve = [];
+  for (let x = 0; x <= 1024; x += 32) curve.push([x, archCurveY(x)]);
+  strokePoly(curve, 12, TERRA, 0.22);
+  strokePoly(curve, 3, SAFFRON, 0.85);
+  // Stone seams across the band.
+  for (const x of [128, 256, 384, 640, 768, 896]) {
+    fillRect(x, 0, 2, archCurveY(x), TERRA, 0.18);
+  }
+}
+
+// ---------------- Cliffs with terraces (sunlit limestone, mirrorable) ----------------
+function dome(cx, baseY, r, hex) {
   const pts = [];
-  for (let k = 0; k <= steps; k++) {
-    const t = a0 + (a1 - a0) * k / steps;
-    pts.push([cx + rx * Math.cos(t), cy + ry * Math.sin(t)]);
+  for (let i = 0; i <= 10; i++) {
+    const a = Math.PI - (Math.PI * i) / 10;
+    pts.push([cx + r * Math.cos(a), baseY - r * Math.sin(a)]);
   }
-  return pts;
+  pts.push([cx + r, baseY], [cx - r, baseY]);
+  fillPoly(pts, hex);
 }
-
-// ---------------------------------------------------------------- scene
-const HORIZON = 640;
-
-// 1. Sky: deep indigo at top, apricot dusk at the horizon
-vgrad(0, W, 0, HORIZON, [
-  [0.00, [18, 24, 46]],
-  [0.38, [58, 52, 84]],
-  [0.62, [146, 90, 96]],
-  [0.85, [240, 148, 96]],
-  [1.00, [250, 190, 120]],
-]);
-
-// 2. Sun, low and warm, just right of centre
-glow(640 * SS, 585 * SS, 210 * SS, APRICOT, 0.55);
-glow(640 * SS, 585 * SS, 110 * SS, GOLD, 0.6);
-disc(640 * SS, 585 * SS, 42 * SS, [250, 205, 118]);
-
-// 3. Stars in the upper opening (above the title)
-for (let k = 0; k < 26; k++) {
-  const x = 250 + rand() * 524, y = 232 + rand() * 105;
-  const r = 0.8 + rand() * 1.6;
-  disc(x * SS, y * SS, r * SS, ALABASTER, 0.35 + rand() * 0.5);
-  if (rand() < 0.25) glow(x * SS, y * SS, 7 * SS, ALABASTER, 0.25);
-}
-
-// 4. Distant headland ridge, right of centre, softened by mist
-fillPoly([[[700, 646], [820, 616], [905, 630], [965, 620], [965, 650], [700, 650]].map(p => [D(p[0]), D(p[1])])], [27, 42, 69]);
-disc(D(838), D(620), D(10), [27, 42, 69]); // tiny dome on the ridge
-
-// 5. Horizon mist bands
-for (let k = 0; k < 26; k++) {
-  const y = 600 + k;
-  const a = 0.30 * Math.sin(Math.PI * k / 26);
-  rect(60, y, 964, y + 1, [247, 193, 143], a);
-}
-
-// 6. Lagoon: warm near the horizon, deep indigo below (the split-time water)
-vgrad(0, W, HORIZON, H, [
-  [0.00, [122, 90, 82]],
-  [0.10, [46, 96, 104]],
-  [0.35, [24, 72, 88]],
-  [0.70, [16, 44, 66]],
-  [1.00, [9, 18, 34]],
-]);
-
-// Sun shimmer column on the water
-for (let k = 0; k < 46; k++) {
-  const y = 652 + rand() * 230;
-  const wHalf = 8 + rand() * 42 * (1 - (y - 652) / 260);
-  const cx = 640 + (rand() - 0.5) * wHalf * 2;
-  rect(cx - wHalf, y, cx + wHalf, y + 2.2, GOLD, 0.16 + rand() * 0.22);
-}
-
-// 7. The Great Arch: one big polygon, outer edge over the top, inner opening
-const archOuter = [[0, H], [0, 358]]
-  .concat(ellipsePts(512, 790, 640, 720, Math.PI, 2 * Math.PI, 48))
-  .concat([[W, 358], [W, H]]);
-const archInner = ellipsePts(512, 800, 470, 580, 2 * Math.PI, Math.PI, 48)
-  .concat([[79, H], [0, H]]);
-const archPoly = archOuter.concat(archInner);
-fillPoly([archPoly.map(p => [D(p[0]), D(p[1])])], INDIGO);
-
-// Inner rim light: saffron line tracing the inner curve, alabaster line just inside it
-const rim = ellipsePts(512, 800, 470, 580, Math.PI * 1.02, Math.PI * 1.98, 60);
-strokePath(rim, 5, SAFFRON, false, 0.85);
-const rim2 = ellipsePts(512, 800, 462, 572, Math.PI * 1.04, Math.PI * 1.96, 60);
-strokePath(rim2, 2, ALABASTER, false, 0.5);
-
-// 8. Terraced pavilions on the inner curve (left and right), with domes and lanterns
-function terrace(thetaDeg, flip) {
-  const t = thetaDeg * Math.PI / 180;
-  const cx = 512 + 470 * Math.cos(t), cy = 800 + 580 * Math.sin(t);
-  const dir = flip ? -1 : 1;
-  // stepped platform, jutting toward the centre
-  const px0 = cx, px1 = cx + dir * 118;
-  rect(Math.min(px0, px1), cy - 4, Math.max(px0, px1), cy + 6, ALABASTER, 0.96);
-  rect(Math.min(px0, px1) + (flip ? 14 : 0), cy + 6, Math.max(px0, px1) - (flip ? 0 : 14), cy + 12, [214, 200, 170], 0.9);
-  // small pavilion: rect + verdigris dome
-  const domex = cx + dir * 34;
-  rect(domex - 16, cy - 26, domex + 16, cy - 4, ALABASTER, 0.96);
-  fillPoly([ellipsePts(domex, cy - 26, 17, 15, Math.PI, 2 * Math.PI, 16).map(p => [D(p[0]), D(p[1])])], VERDIGRIS);
-  disc(D(domex), D(cy - 27), D(2.5), SAFFRON);
-  // lanterns strung along the platform
-  for (let k = 0; k < 3; k++) {
-    const lx = cx + dir * (22 + k * 32), ly = cy - 12 - (k % 2) * 4;
-    disc(D(lx), D(ly), D(3.2), SAFFRON);
-    glow(lx * SS, ly * SS, 11 * SS, SAFFRON, 0.5);
+function terraceBuilding(x, baseY, w, h, withDome) {
+  fillRect(x, baseY - h, w, h, CREAM);
+  fillRect(x, baseY - h, w, 4, '#FFFFFF', 0.5);
+  // Arched window.
+  fillRect(x + w * 0.38, baseY - h * 0.72, w * 0.24, h * 0.42, '#2A2438');
+  fillCircle(x + w * 0.5, baseY - h * 0.72, w * 0.12, '#2A2438');
+  // Warm window light.
+  fillRect(x + w * 0.44, baseY - h * 0.60, w * 0.12, h * 0.18, SAFFRON, 0.85);
+  if (withDome) {
+    dome(x + w * 0.5, baseY - h, w * 0.34, VERDIGRIS);
+    fillCircle(x + w * 0.5, baseY - h - w * 0.34, 2.5, SAFFRON);
   }
 }
-terrace(207, false); terrace(222, false); terrace(238, false);
-terrace(333, true); terrace(318, true); terrace(302, true);
-
-// 9. Hanging skybridges across the opening, lanterns strung along the sag
-function bridge(yL, yR, sag) {
-  const pts = [];
-  for (let k = 0; k <= 24; k++) {
-    const t = k / 24;
-    pts.push([185 + (839 - 185) * t, yL + (yR - yL) * t + sag * Math.sin(Math.PI * t)]);
+function lantern(x, y) {
+  glow(x, y, 14, SAFFRON, 0.5);
+  fillCircle(x, y, 3.2, SAFFRON);
+}
+function drawCliff(mirror) {
+  const mx = (x) => (mirror ? 1024 - x : x);
+  // Stepped cliff face, sunlit limestone.
+  const face = [
+    [0, 140], [80, 140], [80, 210], [120, 210], [120, 290], [155, 290],
+    [155, 380], [185, 380], [185, 470], [210, 470], [210, 620], [0, 620],
+  ].map(([x, y]) => [mx(x), y]);
+  fillPoly(face, SAND);
+  // Warm shadow on the inner edge, highlight on the terrace tops.
+  const shade = [
+    [175, 470], [210, 470], [210, 620], [0, 620], [0, 600], [175, 600],
+  ].map(([x, y]) => [mx(x), y]);
+  fillPoly(shade, TERRA, 0.28);
+  for (const [sx, sy, ex] of [[0, 140, 80], [0, 210, 120], [0, 290, 155], [0, 380, 185], [0, 470, 210]]) {
+    fillRect(Math.min(mx(sx), mx(ex)), sy, Math.abs(ex - sx), 3, ALABASTER, 0.55);
   }
-  strokePath(pts, 3, SAFFRON, false, 0.9);
-  for (let k = 2; k < 24; k += 3) {
-    const p = pts[k];
-    disc(D(p[0]), D(p[1] + 5), D(2.6), SAFFRON);
-    glow(p[0] * SS, (p[1] + 5) * SS, 8 * SS, SAFFRON, 0.45);
-  }
-}
-bridge(498, 492, 34);
-bridge(566, 572, 26);
-
-// 10. Water reflections of the arch pillars: dark streaks with seafoam edges
-for (const [x0, x1] of [[36, 96], [928, 988]]) {
-  fillPoly([[[x0, HORIZON], [x1, HORIZON], [x1 - 14, 830], [x0 + 14, 830]].map(p => [D(p[0]), D(p[1])])], [13, 20, 36], 0.85);
-  strokePath([[x0 + 8, HORIZON + 6], [x0 + 18, 820]], 2, SEAFOAM, false, 0.35);
-}
-// Bioluminescent ripples across the lagoon
-for (let k = 0; k < 34; k++) {
-  const y = 668 + rand() * 330;
-  const x = 90 + rand() * 844;
-  const len = 26 + rand() * 90;
-  rect(x, y, x + len, y + 1.8, SEAFOAM, 0.10 + rand() * 0.22);
-}
-// Soft seafoam glow pooling low in the water
-glow(512 * SS, 940 * SS, 300 * SS, SEAFOAM, 0.10);
-
-// 11. Distant skiff near the horizon, sailing toward the arch
-(function distantSkiff() {
-  const x = 712, y = 664;
-  strokePath([[x - 16, y], [x + 16, y], [x + 11, y + 6], [x - 11, y + 6]], 2, [20, 28, 44]);
-  fillPoly([[[x, y - 16], [x + 12, y - 1], [x, y - 1]].map(p => [D(p[0]), D(p[1])])], APRICOT, 0.9);
-})();
-
-// 12. Foreground skiff, lower left, crescent sail, luminous wake
-(function skiff() {
-  // wake: bright streaks trailing toward the arch (bottom right)
-  const wake = [
-    [[268, 936], [430, 968], [428, 976], [266, 944]],
-    [[252, 946], [380, 992], [376, 1000], [248, 952]],
-    [[282, 928], [470, 946], [470, 952], [284, 936]],
+  // Terrace buildings, one per step.
+  const buildings = [
+    [10, 210, 62, 52, true],
+    [46, 290, 68, 58, true],
+    [80, 380, 72, 62, true],
+    [112, 470, 76, 68, true],
   ];
-  for (const w of wake) fillPoly([w.map(p => [D(p[0]), D(p[1])])], SEAFOAM, 0.55);
-  glow(300 * SS, 950 * SS, 60 * SS, SEAFOAM, 0.35);
-  // hull
-  fillPoly([[[148, 902], [292, 902], [272, 928], [172, 928]].map(p => [D(p[0]), D(p[1])])], DARKWOOD);
-  strokePath([[148, 902], [292, 902]], 2.5, ALABASTER, false, 0.7);
-  // mast
-  strokePath([[220, 902], [220, 796]], 3.5, DARKWOOD);
-  // crescent sail: ONE closed contour — outer arc down, inner arc back up
-  const outer = ellipsePts(196, 852, 66, 62, -1.35, 1.15, 22);
-  const inner = ellipsePts(232, 852, 58, 58, 1.15, -1.35, 22);
-  const crescent = outer.concat(inner);
-  fillPoly([crescent.map(p => [D(p[0]), D(p[1])])], SAFFRON);
-  strokePath(ellipsePts(196, 852, 66, 62, -1.35, 1.15, 22), 2, ALABASTER, false, 0.6);
-  // small sailor silhouette
-  disc(D(238), D(890), D(5), DARKWOOD);
-  fillPoly([[[232, 896], [244, 896], [242, 902], [234, 902]].map(p => [D(p[0]), D(p[1])])], DARKWOOD);
-})();
-
-// ---------------------------------------------------------------- typography
-// Title letters drawn as thick geometric strokes (Art Deco / carved stone).
-// Each letter is defined in unit space: u 0..1 across its width, v 0..1 down the cap height.
-const TITLE = {
-  O: { w: 0.80, strokes: [ellipsePts(0.5, 0.5, 0.36, 0.47, 0, Math.PI * 2, 26)] },
-  S: { w: 0.62, strokes: [[
-    [0.74, 0.03], [0.52, 0.00], [0.30, 0.05], [0.16, 0.15], [0.13, 0.28],
-    [0.20, 0.40], [0.36, 0.48], [0.55, 0.52], [0.72, 0.58], [0.84, 0.70],
-    [0.82, 0.84], [0.68, 0.94], [0.46, 0.98], [0.26, 0.94],
-  ]] },
-  M: { w: 0.92, strokes: [[[0.04, 1.0], [0.04, 0.0], [0.5, 0.60], [0.96, 0.0], [0.96, 1.0]]] },
-  A: { w: 0.82, strokes: [
-    [[0.06, 1.0], [0.5, 0.0], [0.94, 1.0]],
-    [[0.30, 0.64], [0.70, 0.64]],
-  ] },
-  R: { w: 0.72, strokes: [
-    [[0.07, 0.0], [0.07, 1.0]],
-    [[0.07, 0.02], [0.35, 0.0], [0.62, 0.04], [0.80, 0.14], [0.84, 0.26], [0.76, 0.40], [0.58, 0.48], [0.30, 0.50], [0.07, 0.50]],
-    [[0.45, 0.46], [0.70, 0.72], [0.92, 1.0]],
-  ] },
-};
-
-function drawTitleLetter(ch, x0, y0, capH, rgb, dx = 0, dy = 0) {
-  const def = TITLE[ch];
-  const sw = capH * 0.165;
-  for (const s of def.strokes) {
-    const pts = s.map(p => [x0 + dx + p[0] * def.w * capH, y0 + dy + p[1] * capH]);
-    const closed = ch === "O";
-    strokePath(pts, sw, rgb, closed);
+  for (const [bx, by, bw, bh, dm] of buildings) {
+    const x0 = mirror ? 1024 - bx - bw : bx;
+    terraceBuilding(x0, by, bw, bh, dm);
   }
-  return def.w * capH;
-}
-
-const titleWord = "OSMARA";
-const capH = 108;
-const gap = 15;
-let titleW = 0;
-for (const ch of titleWord) titleW += TITLE[ch].w * capH;
-titleW += gap * (titleWord.length - 1);
-let tx = (W - titleW) / 2;
-const ty = 348;
-// warm saffron edge, offset down-right, then alabaster face
-let cx = tx;
-for (const ch of titleWord) { cx += drawTitleLetter(ch, cx, ty, capH, SAFFRON, 4, 5) + gap; }
-cx = tx;
-for (const ch of titleWord) { cx += drawTitleLetter(ch, cx, ty, capH, ALABASTER) + gap; }
-
-// Subtitle: small tracked capitals from a 3x5 grid stroke font
-const FONT = {
-  T: [[[0, 0], [2, 0]], [[1, 0], [1, 4]]],
-  H: [[[0, 0], [0, 4]], [[2, 0], [2, 4]], [[0, 2], [2, 2]]],
-  E: [[[0, 0], [0, 4]], [[0, 0], [2, 0]], [[0, 2], [1.7, 2]], [[0, 4], [2, 4]]],
-  I: [[[0, 0], [2, 0]], [[0, 4], [2, 4]], [[1, 0], [1, 4]]],
-  D: [[[0, 0], [0, 4]], [[0, 0], [1.4, 0]], [[1.4, 0], [2, 1]], [[2, 1], [2, 3]], [[2, 3], [1.4, 4]], [[1.4, 4], [0, 4]]],
-  A: [[[0, 4], [1, 0], [2, 4]], [[0.5, 2.6], [1.5, 2.6]]],
-  L: [[[0, 0], [0, 4]], [[0, 4], [2, 4]]],
-  S: [[[1.8, 0.3], [1, 0], [0.3, 0.5], [0.2, 1.4], [0.8, 2], [1.5, 2.2], [1.9, 3], [1.6, 3.8], [0.8, 4], [0.2, 3.7]]],
-  N: [[[0, 4], [0, 0], [2, 4], [2, 0]]],
-  C: [[[1.8, 0.5], [1, 0], [0.2, 0.8], [0, 2], [0.2, 3.2], [1, 4], [1.8, 3.5]]],
-  U: [[[0, 0], [0, 3.2], [0.5, 4], [1.5, 4], [2, 3.2], [2, 0]]],
-  R: [[[0, 0], [0, 4]], [[0, 0], [1.5, 0], [2, 1], [1.5, 2], [0, 2]], [[1, 2], [2, 4]]],
-  Y: [[[0, 0], [1, 2], [2, 0]], [[1, 2], [1, 4]]],
-};
-function drawSmall(ch, x0, y0, h, rgb) {
-  const unit = h / 4;
-  for (const s of FONT[ch]) {
-    strokePath(s.map(p => [x0 + p[0] * unit, y0 + p[1] * unit]), h * 0.16, rgb);
+  // Hanging walkways with lanterns between terraces.
+  const walks = [
+    [[72, 202], [122, 282]],
+    [[118, 372], [172, 462]],
+  ];
+  for (const [p1, p2] of walks) {
+    const a = [mx(p1[0]), p1[1]], b = [mx(p2[0]), p2[1]];
+    strokePoly([a, b], 2.5, SAFFRON, 0.8);
+    lantern((a[0] + b[0]) / 2, (a[1] + b[1]) / 2 + 4);
+  }
+  lantern(mx(36), 196);
+  lantern(mx(176), 456);
+  lantern(mx(60), 286);
+  lantern(mx(140), 376);
+  // Tiered tidal pools stepped into the cliff, glowing seafoam.
+  const pools = [[64, 282, 52, 10], [88, 372, 56, 10], [112, 462, 66, 10]];
+  for (const [px0, py0, pw, ph] of pools) {
+    const x0 = mirror ? 1024 - px0 - pw : px0;
+    fillRect(x0, py0, pw, ph, SEAFOAM, 0.9);
+    fillRect(x0, py0, pw, 2, '#DFFCF5', 0.9);
   }
 }
-const subtitle = "THE TIDAL SANCTUARY";
-const subH = 20, subAdv = 15, subTrack = 11;
-let subW = 0;
-for (const ch of subtitle) subW += ch === " " ? subTrack + 6 : subAdv + subTrack;
-subW -= subTrack;
-let sx = (W - subW) / 2;
-const sy = 972;
-for (const ch of subtitle) {
-  if (ch !== " ") drawSmall(ch, sx, sy, subH, ALABASTER);
-  sx += ch === " " ? subTrack + 6 : subAdv + subTrack;
+
+// ---------------- Salt-glass pavilions (the invented signature) ----------------
+function glassPavilion(x, baseY, w, h) {
+  // Stone base.
+  fillRect(x, baseY - 8, w, 8, '#2A2438');
+  // Translucent glass walls, seafoam, with a warm interior glow.
+  glow(x + w / 2, baseY - h * 0.55, w * 0.7, SAFFRON, 0.35);
+  fillPoly([[x, baseY - 8], [x, baseY - h * 0.72], [x + w / 2, baseY - h], [x + w, baseY - h * 0.72], [x + w, baseY - 8]], SEAFOAM, 0.42);
+  // Faceted roof ridge and glass edges.
+  strokePoly([[x, baseY - h * 0.72], [x + w / 2, baseY - h], [x + w, baseY - h * 0.72]], 3, '#DFFCF5', 0.9);
+  strokePoly([[x, baseY - 8], [x, baseY - h * 0.72]], 3, '#DFFCF5', 0.8);
+  strokePoly([[x + w, baseY - 8], [x + w, baseY - h * 0.72]], 3, '#DFFCF5', 0.8);
+  // Warm interior mullions.
+  fillRect(x + w * 0.30, baseY - h * 0.66, 3, h * 0.58, SAFFRON, 0.75);
+  fillRect(x + w * 0.66, baseY - h * 0.66, 3, h * 0.58, SAFFRON, 0.75);
+  fillRect(x + w * 0.12, baseY - h * 0.40, w * 0.76, 3, SAFFRON, 0.6);
 }
-// small saffron diamonds flanking the subtitle
-for (const dx of [sx - subW - 34, sx + 20]) {
-  fillPoly([[[dx, sy + 10], [dx + 6, sy + 4], [dx + 12, sy + 10], [dx + 6, sy + 16]].map(p => [D(p[0]), D(p[1])])], SAFFRON);
+function drawPavilions() {
+  // Left quay with two glass pavilions.
+  fillRect(16, 884, 300, 46, '#2A2438');
+  fillRect(16, 884, 300, 3, ALABASTER, 0.3);
+  glassPavilion(64, 884, 92, 118);
+  glassPavilion(168, 884, 68, 84);
+  // Right quay with one pavilion.
+  fillRect(724, 872, 260, 46, '#2A2438');
+  fillRect(724, 872, 260, 3, ALABASTER, 0.3);
+  glassPavilion(788, 872, 104, 128);
+  // Small quay lanterns.
+  lantern(28, 878);
+  lantern(304, 878);
+  lantern(736, 866);
+  lantern(972, 866);
 }
 
-// ---------------------------------------------------------------- downsample 2x -> 1024 and encode PNG
-const out = new Uint8Array(W * H * 3);
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const o = (y * W + x) * 3;
-    let r = 0, g = 0, b = 0;
-    for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
-      const i = ((y * 2 + dy) * DW + x * 2 + dx) * 3;
-      r += buf[i]; g += buf[i + 1]; b += buf[i + 2];
+// ---------------- Skiffs ----------------
+function drawSkiffs() {
+  // Foreground crescent-sailed skiff in open water, sailing toward the arch.
+  fillPoly([[300, 830], [380, 830], [370, 848], [312, 848]], '#3A2A20');
+  strokePoly([[340, 830], [340, 762]], 4, '#3A2A20');
+  fillPoly([[340, 762], [384, 822], [340, 822]], ALABASTER);
+  strokePoly([[340, 762], [384, 822]], 2, SAFFRON, 0.9);
+  fillPoly([[340, 762], [356, 756], [340, 750]], SAFFRON);
+  // Luminous wake cutting across the water toward the viewer.
+  for (let i = 0; i < 6; i++) {
+    const y = 852 + i * 12;
+    const len = 96 - i * 10;
+    fillRect(288 - i * 8, y, len, 3, SEAFOAM, 0.75 - i * 0.09);
+  }
+  // Two tiny distant skiffs near the horizon.
+  for (const [sx, sy, s] of [[790, 618, 1], [884, 624, 0.8]]) {
+    fillRect(sx - 11 * s, sy, 22 * s, 4, '#241A33');
+    fillPoly([[sx, sy], [sx, sy - 13 * s], [sx + 11 * s, sy]], ALABASTER, 0.85);
+  }
+}
+
+// ---------------- Title and subtitle band ----------------
+function drawTitle() {
+  const size = 152;
+  const tracking = 28;
+  const w = textWidth('OSMARA', size, tracking);
+  const x = (1024 - w) / 2;
+  const y = 138;
+  // Saffron edge shadow, then the alabaster letters on top.
+  drawText('OSMARA', x + 6, y + 7, size, SAFFRON, tracking, 3.2);
+  drawText('OSMARA', x, y, size, ALABASTER, tracking, 3.2);
+}
+function drawBottomBand() {
+  fillRect(0, 950, 1024, 74, INDIGO);
+  fillRect(0, 947, 1024, 4, SAFFRON);
+  const size = 26;
+  const tracking = 7;
+  const w = textWidth('THE TIDAL SANCTUARY', size, tracking);
+  const x = (1024 - w) / 2;
+  drawText('THE TIDAL SANCTUARY', x, 972, size, ALABASTER, tracking, 2.6);
+  // Saffron diamonds flanking the subtitle.
+  const d1 = x - 38, d2 = x + w + 38, cy = 985;
+  fillPoly([[d1, cy - 8], [d1 + 8, cy], [d1, cy + 8], [d1 - 8, cy]], SAFFRON);
+  fillPoly([[d2, cy - 8], [d2 + 8, cy], [d2, cy + 8], [d2 - 8, cy]], SAFFRON);
+}
+
+// ---------------- Downsample and write ----------------
+function downsample() {
+  const out = Buffer.alloc(W * H * 4);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i0 = ((y * SS) * CW + x * SS) * 4;
+      const i1 = i0 + 4, i2 = i0 + CW * 4, i3 = i2 + 4;
+      const o = (y * W + x) * 4;
+      out[o] = (pixels[i0] + pixels[i1] + pixels[i2] + pixels[i3] + 2) >> 2;
+      out[o + 1] = (pixels[i0 + 1] + pixels[i1 + 1] + pixels[i2 + 1] + pixels[i3 + 1] + 2) >> 2;
+      out[o + 2] = (pixels[i0 + 2] + pixels[i1 + 2] + pixels[i2 + 2] + pixels[i3 + 2] + 2) >> 2;
+      out[o + 3] = 255;
     }
-    out[o] = (r + 2) >> 2; out[o + 1] = (g + 2) >> 2; out[o + 2] = (b + 2) >> 2;
   }
+  return out;
 }
 
-// CRC32 (PNG chunk checksums)
-const crcTable = new Uint32Array(256);
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  crcTable[n] = c >>> 0;
-}
-function crc32(bytes) {
-  let c = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function chunk(type, data) {
-  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
-  const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
-  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
-  return Buffer.concat([len, td, crc]);
+function main() {
+  drawSky();
+  drawSun();
+  drawWater();
+  drawArch();
+  drawCliff(false);
+  drawCliff(true);
+  drawPavilions();
+  drawSkiffs();
+  drawTitle();
+  drawBottomBand();
+  const png = encodePng(W, H, downsample());
+  const outDir = '/output';
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, 'entry.png'), png);
+  console.log('wrote', path.join(outDir, 'entry.png'), png.length, 'bytes');
 }
 
-// Filter each scanline: choose None or Up by sum of absolute byte values (heuristic)
-const raw = Buffer.alloc(H * (1 + W * 3));
-for (let y = 0; y < H; y++) {
-  const row = out.subarray(y * W * 3, (y + 1) * W * 3);
-  const prev = y === 0 ? null : out.subarray((y - 1) * W * 3, y * W * 3);
-  let sumNone = 0, sumUp = 0;
-  for (let i = 0; i < row.length; i++) {
-    const v = row[i];
-    sumNone += Math.abs(v < 128 ? v : v - 256);
-    if (prev) { const d = v - prev[i]; sumUp += Math.abs(d < 128 ? d : d - 256); }
-  }
-  const off = y * (1 + W * 3);
-  if (prev && sumUp < sumNone) {
-    raw[off] = 2;
-    for (let i = 0; i < row.length; i++) raw[off + 1 + i] = (row[i] - prev[i]) & 0xff;
-  } else {
-    raw[off] = 0;
-    raw.set(row, off + 1);
-  }
-}
-const idat = deflateSync(raw, { level: 9 });
-
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-
-const png = Buffer.concat([
-  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-  chunk("IHDR", ihdr),
-  chunk("IDAT", idat),
-  chunk("IEND", Buffer.alloc(0)),
-]);
-
-mkdirSync("/output", { recursive: true });
-writeFileSync("/output/entry.png", png);
-console.log("wrote /output/entry.png", png.length, "bytes");
+main();
